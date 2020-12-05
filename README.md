@@ -1,1 +1,1 @@
-Files from my project at CERN - "Perl to python migration"
+Scipts which I have converted during my "Perl to Python migration" task at CERN.
