@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+# This code is imported from https://github.com/cms-sw/cms-git-tools/blob/master/git-cms-checkdeps
+
+import sys
+import re
+import gzip
+import tempfile
+import shutil
+import subprocess
+from os import path, symlink, environ, chdir, makedirs
+from optparse import OptionParser
+
+# Idea: diff checked out packages.
+#       looking for changed headers
+#       find all packages that depend on those headers
+#       print that list.
+
+poisondir = "poison"
+help_text = "\n\
+    Utility to check your local development area against the CMSSW release.\n\
+    Any modified header files or python modules are found and the package \n\
+    dependencies of these files will be returned. addpkg-ing these packages\n\
+    and rebuilding them should provide a full and consistent build."
+
+parser = OptionParser(description=help_text, conflict_handler="resolve")
+parser.add_option("-a", dest="checkout", default=False, action="store_true",
+                  help="will add/checkout the packages into your development area", metavar=" ")
+parser.add_option("-p", dest="checkpython", default=False, action="store_true",
+                  help="look for python modules and their dependencies  (ON by default)", metavar=" ")
+parser.add_option("-h", dest="checkheader", default=False, action="store_true",
+                  help="look for header files and their dependencies (ON by default)", metavar=" ")
+parser.add_option("-b", dest="checkbuildfile", default=False, action="store_true",
+                  help="look for BuildFile files and their dependencies (OFF by default)", metavar=" ")
+parser.add_option("-f", dest="printFileNames", default=False, action="store_true",
+                  help="print name of changed file name instead of type of dependency (OFF by default)", metavar=" ")
+parser.add_option("-d", dest="poison_includes", default=False, action="store_false",
+                  help="do not create dummy copy of deleted files in %s directory. Dummy copies\
+ are useful to find out if deleted headers files are included by other source files." % poisondir, metavar=" ")
+parser.add_option("-D", dest="poison_only", default=False, action="store_true",
+                  help="only dummy copy of deleted files in %s directory created.\
+ NOTE: all other dependency check/add command-line args are ignored." % poisondir, metavar=" ")
+parser.add_option("-A", dest="all", action="store_true",
+                  help="will check all dependencies i.e. header (-h), python(-p) and BuildFile(-b)", metavar=" ")
+
+(options, args) = parser.parse_args()
+
+checkout = options.checkout
+checkpython = options.checkpython
+checkheader = options.checkheader
+checkbuildfile = options.checkbuildfile
+printFileNames = options.printFileNames
+poison_includes = options.poison_includes
+poison_only = options.poison_only
+all = options.all
+
+if checkout:
+    if not poison_includes:
+        poison_includes = True
+if all:
+    checkpython = checkheader = checkbuildfile = True
+
+if poison_only:
+    checkpython = False
+    checkheader = False
+    checkbuildfile = False
+    checkout = False
+    poison_includes = True
+elif (not checkpython) & (not checkheader) & (not checkbuildfile):
+    checkpython = True
+    checkheader = True
+
+try:
+    localtop = environ["CMSSW_BASE"]
+except KeyError:
+    print("ERROR: Could not find developer area base path. Please run \"cmsenv\" in a developer area.")
+    sys.exit(1)
+
+try:
+    releasetop = environ["CMSSW_RELEASE_BASE"]
+except KeyError:
+    print("ERROR: Could not find release base path. Please run this script from a developer area.")
+    sys.exit(1)
+
+vals = {}
+changedFiles = []
+deletedFiles = []
+upackages = {}
+
+
+def readDependencyInfo(file, cache):
+    global vals
+    for line in gzip.open(file).readlines():
+        line = line.decode('utf-8').rstrip('\n')
+        file1, rest = line.split(' ', 1)
+        if file1 != "":
+            if file1 not in vals:
+                vals[file1] = []
+            vals[file1].extend(rest.split(' '))
+
+
+def poisonIncludes(deletedFiles, topdir):
+    poison = path.join(topdir, poisondir)
+    if path.isdir(poison):
+        shutil.rmtree(poison)
+    poisondata = path.join(poison, ".data")
+    makedirs(poisondata)
+    if len(deletedFiles) > 0:
+        print(">> Creating dummy files under %s directory." % poison)
+    for file in deletedFiles:
+        f = path.join(poison, file)
+        dir = path.dirname(f)
+        if not path.isdir(dir):
+            makedirs(dir)
+        if re.search(r'\/data\/', file):
+            symlink(poisondata, f)
+        else:
+            try:
+                with open(f, "w") as xfile:
+                    xfile.write(
+                        "#error THIS FILE HAS BEEN REMOVED FROM THE PACKAGE.\n")
+            except Exception as e:
+                print(e, "\nERROR: Can not open file for writing: %s\n" % f)
+        print("   %s" % file)
+
+
+if checkheader:
+    depfile = "%s/etc/dependencies/usedby.out.gz" % releasetop
+    if path.isfile(depfile):
+        readDependencyInfo(depfile, vals)
+    else:
+        print("ERROR: This release appears not to support the functionality of this script (170pre4 and higher). Sorry")
+
+if checkpython:
+    depfile = "%s/etc/dependencies/pyusedby.out.gz" % releasetop
+    if path.isfile(depfile):
+        readDependencyInfo(depfile, vals)
+
+if checkbuildfile:
+    depfile = "%s/etc/dependencies/bfusedby.out.gz" % releasetop
+    if path.isfile(depfile):
+        readDependencyInfo(depfile, vals)
+
+chdir("%s/src" % localtop)
+reltag = None
+if environ.get("CMSSW_GIT_HASH"):
+    reltag = environ["CMSSW_GIT_HASH"]
+else:
+    reltag = environ["CMSSW_VERSION"]
+
+args_0 = ['git', 'diff', '''-G^([^$]+$|[^$]*[$][^$]*$|([^$]*[$])($|[^RAIDLNSH]|(R[^eC]|A[^u]|I[^d]|D[^a]|L[^o]|
+    N[^a]|S[^o]|H[^e])|(Re[^v]|RC[^S]|Au[^t]|Id[^:]|Da[^t]|Lo[^g]|Na[^m]|So[^u]|He[^a])|(Rev[^i]|RCS[^f]|Aut[^h]|
+    Dat[^e]|Log[^:]|Nam[^e]|Sou[^r]|Hea[^d])|(Revi[^s]|RCSf[^i]|Auth[^o]|Date[^:]|Name[^:]|Sour[^c]|Head[^e])|
+    (Revis[^i]|RCSfi[^l]|Autho[^r]|Sourc[^e]|Heade[^r])|(Revisi[^o]|RCSfil[^e]|Author[^:]|Source[^:]|Header[^:])|
+    (Revisio[^n]|RCSfile[^:])|(Revision[^:])))''', '--name-status', '-r', reltag]
+args_1 = ['grep', '-v', '.gitignore']
+args_2 = ['sed', '-e', 's/[ \\t]\\+/ /']
+args_3 = ['git', 'diff', '--diff-filter', 'R', '--name-status', '-r', reltag]
+pipe_0 = subprocess.Popen(args_0, stdout=subprocess.PIPE)
+pipe_1 = subprocess.Popen(args_1, stdin=pipe_0.stdout, stdout=subprocess.PIPE)
+pipe_2 = subprocess.Popen(args_2, stdin=pipe_1.stdout, stdout=subprocess.PIPE)
+pipe_3 = subprocess.Popen(args_3, stdout=subprocess.PIPE)
+stdout = pipe_2.communicate()[0].splitlines()
+stdout.extend(pipe_3.communicate()[0].splitlines())
+for diff in stdout:
+    diff = diff.decode()
+    match = re.search(
+        r'^[MUDR]([0-9]*)\s+([^\/]+\/[^\/]+)\/[^\s]+(\s+[^\/]+\/[^\/]+\/[^\s]+|)$', diff)
+    if match:
+        pack = match.group(2)
+        if not pack in upackages:
+            upackages[pack] = []
+            if not path.exists(pack):
+                print(">> Package removed %s" % pack)
+        upackages[pack].append(diff)
+
+packages = sorted(upackages)
+for package in packages:
+    if re.search(r'^UserCode.*', package):
+        continue
+    print(">> Checking %s %s" % (package, reltag))
+    msgs = {"-": {}, "x": {}}
+    for diff in upackages[package]:
+        _del = None
+        match = re.search(r'^(R[0-9]*)\s+([^\s]+)\s+', diff)
+        if match:
+            diff = "D %s" % match.group(2)
+        match_M = re.search(r'^(M)', diff)
+        match_U = re.search(r'^(U)', diff)
+        match_D = re.search(r'^(D)', diff)
+        if match_M or match_U or match_D:
+            for match in [match_M, match_U, match_D]:
+                if match:
+                    if match.group() == "D":
+                        _del = 1
+                    sp2 = diff.split(' ')
+                    diff = sp2[1]
+        else:
+            diff = None
+        if diff:
+            msgs["x"][diff] = 1
+        if _del:
+            msgs["-"][diff] = 1
+    files = sorted(msgs["-"].keys())
+    deletedFiles.extend(files)
+    changedFiles.extend(files)
+    for diff in files:
+        print("   - %s" % diff)
+        del msgs["x"][diff]
+    files = sorted(msgs["x"].keys())
+    changedFiles.extend(files)
+    for diff in files:
+        print("   x %s" % diff)
+
+if poison_includes:
+    poisonIncludes(deletedFiles, localtop)
+if poison_only:
+    sys.exit(0)
+
+recompileList = {}
+big_bf = ""
+for file in changedFiles:
+    if re.search(r'^BigProducts\/[^\/]+\/BuildFile\.xml$', file):
+        big_bf = "%s %s" % (big_bf, file)
+    if file not in vals:
+        continue
+    for dep in vals[file]:
+        sp = dep.split("/")
+        try:
+            recompile = "%s/%s" % (sp[0], sp[1])
+        except IndexError:
+            pass
+        if not list(filter(lambda x: recompile in x, packages)):
+            scope = "header"
+            if re.search(r'\.py$', file):
+                scope = "python"
+            elif re.search(r'\/BuildFile(\.xml|)$', file):
+                scope = "buildfile"
+            if recompile not in recompileList:
+                recompileList[recompile] = {}
+            if scope not in recompileList[recompile]:
+                recompileList[recompile][scope] = {}
+            recompileList[recompile][scope] = file
+
+if big_bf:
+    pipe_0 = subprocess.Popen(["git", "diff","-r", reltag, "--", big_bf.strip()], stdout=subprocess.PIPE)
+    for diff in [l.decode() for l in pipe_0.communicate()[0].splitlines()]:
+        if not diff.startswith('+'):
+            next
+        diff = re.sub(r'^[+]', r'', diff)
+        for p in diff.split(">"):
+            match = re.search(r'^\s*<\s*use\s+name\s*=\s*["]([^"]+)["]\s*', p, re.I)
+            if match:
+                if path.exists("%s/src/%s" % (releasetop, match.group(1))):
+                    pack = match.group(1)
+                    if not pack in recompileList:
+                        recompileList[pack]= {}
+                    recompileList[pack]["biglib"] = "BigProducts"
+
+t = sorted(recompileList.keys())
+len = len(t)
+if not checkout:
+    print("Packages to check out and compile: %s" % len)
+else:
+    print("Checking out these packages: %s" % len)
+
+exitcode = 0
+if len > 0:
+    for pk in t:
+        if printFileNames:
+            print("%s (%s)" %
+                  (pk, ', '.join(sorted(recompileList[pk].values()))))
+        else:
+            print("%s (%s)" %
+                  (pk, ', '.join(sorted(recompileList[pk].keys()))))
+    if checkout:
+        chdir(localtop)
+        temp_path = path.join(environ["CMSSW_BASE"], "tmp")
+        tempfile.tempdir = temp_path
+        temp = tempfile.NamedTemporaryFile(prefix="checkdeps")
+        fname = temp.name
+        for pk in t:
+            temp.write(bytes(pk + "\n"))
+        chdir("%s/src" % localtop)
+        process = subprocess.Popen(['git', 'cms-addpkg', '-f', fname, '-q'])
+        process.wait()
+        exitcode = + process.returncode
+        temp.close()
+if exitcode:
+    exitcode = 1
+sys.exit(exitcode)
